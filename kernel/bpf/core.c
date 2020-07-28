@@ -734,8 +734,8 @@ const struct exception_table_entry *search_bpf_extables(unsigned long addr)
 		goto out;
 
 	e = search_extable(prog->aux->extable,
-	                   prog->aux->extable + prog->aux->num_exentries,
-	                   addr);
+			    prog->aux->extable + prog->aux->num_exentries - 1,
+			    addr);
 out:
 	rcu_read_unlock();
 	return e;

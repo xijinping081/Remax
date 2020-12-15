@@ -291,6 +291,16 @@ int handle_userfault(struct fault_env *fe, unsigned long reason)
 	/* 0 or > 1 flags set is a bug; we expect exactly 1. */
 	VM_BUG_ON(!reason || (reason & (reason - 1)));
 
+	if (ctx->features & UFFD_FEATURE_SIGBUS)
+		goto out;
+	if ((fe->flags & FAULT_FLAG_USER) == 0 &&
+	    ctx->flags & UFFD_USER_MODE_ONLY) {
+		printk_once(KERN_WARNING "uffd: Set unprivileged_userfaultfd "
+			"sysctl knob to 1 if kernel faults must be handled "
+			"without obtaining CAP_SYS_PTRACE capability\n");
+		goto out;
+	}
+
 	/*
 	 * If it's already released don't get it. This avoids to loop
 	 * in __get_user_pages if userfaultfd_release waits on the
@@ -1405,11 +1415,12 @@ static struct file *userfaultfd_file_create(int flags)
 	BUG_ON(!current->mm);
 
 	/* Check the UFFD_* constants for consistency.  */
+	BUILD_BUG_ON(UFFD_USER_MODE_ONLY & UFFD_SHARED_FCNTL_FLAGS);
 	BUILD_BUG_ON(UFFD_CLOEXEC != O_CLOEXEC);
 	BUILD_BUG_ON(UFFD_NONBLOCK != O_NONBLOCK);
 
 	file = ERR_PTR(-EINVAL);
-	if (flags & ~UFFD_SHARED_FCNTL_FLAGS)
+	if (flags & ~(UFFD_SHARED_FCNTL_FLAGS | UFFD_USER_MODE_ONLY))
 		goto out;
 
 	file = ERR_PTR(-ENOMEM);

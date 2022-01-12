@@ -380,6 +380,7 @@ LLVMOBJCOPY	= llvm-objcopy
 OBJDUMP		= $(CROSS_COMPILE)objdump
 endif
 PAHOLE		= pahole
+RESOLVE_BTFIDS	= $(abspath $(objtree))/tools/bpf/resolve_btfids/resolve_btfids
 AWK		= awk
 GENKSYMS	= scripts/genksyms/genksyms
 INSTALLKERNEL  := installkernel
@@ -457,7 +458,7 @@ KERNELVERSION = $(VERSION)$(if $(PATCHLEVEL),.$(PATCHLEVEL)$(if $(SUBLEVEL),.$(S
 
 export VERSION PATCHLEVEL SUBLEVEL KERNELRELEASE KERNELVERSION
 export ARCH SRCARCH CONFIG_SHELL HOSTCC HOSTCFLAGS CROSS_COMPILE LD CC
-export CPP AR NM STRIP OBJCOPY OBJDUMP READELF OBJSIZE PAHOLE
+export CPP AR NM STRIP OBJCOPY OBJDUMP READELF OBJSIZE PAHOLE RESOLVE_BTFIDS
 export MAKE AWK GENKSYMS INSTALLKERNEL PERL PYTHON UTS_MACHINE
 export HOSTCXX HOSTCXXFLAGS LDFLAGS_MODULE CHECK CHECKFLAGS
 
@@ -1343,7 +1344,7 @@ prepare0: archprepare gcc-plugins
 	$(Q)$(MAKE) $(build)=.
 
 # All the preparing..
-prepare: prepare0 prepare-objtool
+prepare: prepare0 prepare-objtool prepare-resolve_btfids
 
 ifdef CONFIG_STACK_VALIDATION
   has_libelf := $(call try-run,\
@@ -1357,9 +1358,20 @@ ifdef CONFIG_STACK_VALIDATION
   endif
 endif
 
-PHONY += prepare-objtool
+PHONY += prepare-objtool prepare-resolve_btfids
 prepare-objtool: $(objtool_target)
 
+ifdef CONFIG_DEBUG_INFO_BTF
+resolve_btfids_target := $(RESOLVE_BTFIDS)
+endif
+
+prepare-resolve_btfids: $(resolve_btfids_target)
+
+$(RESOLVE_BTFIDS): FORCE
+	$(Q)$(MAKE) -C $(srctree)/tools/bpf/resolve_btfids \
+		OUTPUT=$(dir $(RESOLVE_BTFIDS)) \
+		HOSTCC="$(HOSTCC)" HOSTCFLAGS="$(HOSTCFLAGS)" \
+		HOSTLDFLAGS="$(HOSTLDFLAGS)"
 # Check for CONFIG flags that require compiler support. Abort the build
 # after .config has been processed, but before the kernel build starts.
 #

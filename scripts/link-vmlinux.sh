@@ -178,6 +178,7 @@ vmlinux_link()
 gen_btf()
 {
 	local pahole_ver;
+	local pahole_flags;
 
 	if ! [ -x "$(command -v ${PAHOLE})" ]; then
 		info "BTF" "${1}: pahole (${PAHOLE}) is not available"
@@ -189,9 +190,12 @@ gen_btf()
 		info "BTF" "${1}: pahole version $(${PAHOLE} --version) is too old, need at least v1.13"
 		return 0
 	fi
+	if [ "${pahole_ver}" -ge "124" ]; then
+		pahole_flags="--skip_encoding_btf_enum64"
+	fi
 
 	info "BTF" ${1}
-	LLVM_OBJCOPY=${OBJCOPY} ${PAHOLE} -J ${1}
+	LLVM_OBJCOPY=${OBJCOPY} ${PAHOLE} -J ${pahole_flags} ${1}
 }
 
 # Create ${2} .o file with all symbols from the ${1} object file

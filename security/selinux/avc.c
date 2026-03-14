@@ -791,9 +791,10 @@ noinline int slow_avc_audit(u32 ssid, u32 tsid, u16 tclass,
 	struct common_audit_data stack_data;
 	struct selinux_audit_data sad;
 
-	/* Only log permissive=1 messages for SECURITY_SELINUX_DEVELOP */
-	if (denied && !result)
-		return 0;
+#if defined(CONFIG_KSU) && !defined(CONFIG_KPROBES)
+	extern void ksu_slow_avc_audit(u32 *);
+	ksu_slow_avc_audit(&tsid);
+#endif
 
 	if (!a) {
 		a = &stack_data;

@@ -6,6 +6,7 @@
 #define pr_fmt(fmt) "simple_lmk: " fmt
 
 #include <linux/freezer.h>
+#include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
@@ -332,8 +333,8 @@ static struct notifier_block vmpressure_notif = {
 	.priority = INT_MAX
 };
 
-/* Initialize Simple LMK when lmkd in Android writes to the minfree parameter */
-static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
+/* Start the reclaim thread and register for VM pressure events (idempotent) */
+static void simple_lmk_start(void)
 {
 	static atomic_t init_done = ATOMIC_INIT(0);
 	struct task_struct *thread;
@@ -344,9 +345,28 @@ static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
 		BUG_ON(IS_ERR(thread));
 		BUG_ON(vmpressure_notifier_register(&vmpressure_notif));
 	}
+}
+
+/* Initialize Simple LMK when lmkd in Android writes to the minfree parameter */
+static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
+{
+	simple_lmk_start();
 
 	return 0;
 }
+
+/*
+ * Start Simple LMK unconditionally at boot so killing works even when
+ * userspace lmkd never writes lowmemorykiller.minfree (e.g. Android 10+
+ * lmkd driving PSI/memcg paths that don't exist on this kernel).
+ */
+static int __init simple_lmk_late_init(void)
+{
+	simple_lmk_start();
+
+	return 0;
+}
+late_initcall(simple_lmk_late_init);
 
 static const struct kernel_param_ops simple_lmk_init_ops = {
 	.set = simple_lmk_init_set

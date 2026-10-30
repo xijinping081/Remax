@@ -5565,7 +5565,6 @@ static int binder_open(struct inode *nodp, struct file *filp)
 
 	if (!binder_dev) {
 		put_task_struct(proc->tsk);
-		put_cred(proc->cred);
 		kfree(proc);
 		return -ENODEV;
 	}

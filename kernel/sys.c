@@ -1149,6 +1149,16 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 
 	down_read(&uts_sem);
 	memcpy(&tmp, utsname(), sizeof(tmp));
+	if (!strcmp(current->comm, "bpfloader") ||
+	    !strcmp(current->comm, "netbpfload") ||
+	    !strcmp(current->comm, "uprobestatsbpfl") ||
+	    !strcmp(current->comm, "netd")) {
+		if (current_uid().val == 0) {
+			strcpy(tmp.release, "5.15.178");
+			pr_debug("fake uname: %s/%d release=%s\n",
+				 current->comm, current->pid, tmp.release);
+		}
+	}
 	up_read(&uts_sem);
 	if (copy_to_user(name, &tmp, sizeof(tmp)))
 		return -EFAULT;

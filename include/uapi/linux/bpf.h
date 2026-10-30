@@ -305,6 +305,8 @@ enum bpf_attach_type {
  */
 #define BPF_PSEUDO_MAP_FD	1
 #define BPF_PSEUDO_MAP_VALUE	2
+#define BPF_PSEUDO_BTF_ID	3
+#define BPF_PSEUDO_FUNC		4
 
 /* when bpf_call->src_reg == BPF_PSEUDO_CALL, bpf_call->imm == pc-relative
  * offset to another bpf function

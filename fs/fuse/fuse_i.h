@@ -105,6 +105,14 @@ struct fuse_inode {
 
 	/** Lock for serializing lookup and readdir for back compatibility*/
 	struct mutex mutex;
+
+#ifdef CONFIG_FUSE_BPF
+	/** BPF program to filter operations on this inode (FUSE-BPF) */
+	struct bpf_prog *bpf;
+
+	/** Backing inode for FUSE-BPF passthrough */
+	struct inode *backing_inode;
+#endif
 };
 
 /** FUSE inode state bits */

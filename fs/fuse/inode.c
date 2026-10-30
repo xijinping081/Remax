@@ -81,6 +81,20 @@ struct fuse_mount_data {
 	struct file *root_dir;
 };
 
+#ifdef CONFIG_FUSE_BPF
+/**
+ * fuse_get_bpf_prog - get a BPF program from a userspace fd number
+ * @ufd: the file descriptor number referencing a BPF program object
+ *
+ * Returns the bpf_prog pointer on success, ERR_PTR on failure.
+ * The caller is responsible for calling bpf_prog_put() when done.
+ */
+static struct bpf_prog *fuse_get_bpf_prog(u32 ufd)
+{
+	return bpf_prog_get_type(ufd, BPF_PROG_TYPE_UNSPEC);
+}
+#endif /* CONFIG_FUSE_BPF */
+
 static void fuse_mount_data_cleanup(struct fuse_mount_data *d)
 {
 #ifdef CONFIG_FUSE_BPF
@@ -600,7 +614,7 @@ static int parse_fuse_opt(char *opt, struct fuse_mount_data *d, int is_bdev)
 			if (d->root_bpf || match_int(&args[0], &value) ||
 			    value < 0)
 				return 0;
-			d->root_bpf = fuse_get_bpf_prog(fget(value));
+			d->root_bpf = fuse_get_bpf_prog((u32)value);
 			if (IS_ERR(d->root_bpf)) {
 				d->root_bpf = NULL;
 				return 0;

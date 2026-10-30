@@ -26,6 +26,10 @@
 #include <linux/kref.h>
 #include <linux/xattr.h>
 
+#ifdef CONFIG_FUSE_BPF
+#include <linux/filter.h>
+#endif
+
 /** Max number of pages that can be used in a single read request */
 #define FUSE_MAX_PAGES_PER_REQ 32
 

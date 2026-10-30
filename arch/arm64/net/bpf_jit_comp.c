@@ -165,24 +165,6 @@ static inline void emit_a64_mov_i64(const int reg, const u64 val,
 	}
 }
 
-/*
- * Kernel addresses in the vmalloc space use at most 48 bits, and the
- * remaining bits are guaranteed to be 0x1. So we can compose the address
- * with a fixed length movn/movk/movk sequence.
- */
-static inline void emit_addr_mov_i64(const int reg, const u64 val,
-				     struct jit_ctx *ctx)
-{
-	u64 tmp = val;
-	int shift = 0;
-
-	emit(A64_MOVN(1, reg, ~tmp & 0xffff, shift), ctx);
-	while (shift < 32) {
-		tmp >>= 16;
-		shift += 16;
-		emit(A64_MOVK(1, reg, tmp & 0xffff, shift), ctx);
-	}
-}
 
 static inline int bpf2a64_offset(int bpf_to, int bpf_from,
 				 const struct jit_ctx *ctx)

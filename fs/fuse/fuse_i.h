@@ -10,6 +10,7 @@
 #define _FS_FUSE_I_H
 
 #include <linux/fuse.h>
+#include <linux/android_fuse.h>
 #include <linux/fs.h>
 #include <linux/mount.h>
 #include <linux/wait.h>

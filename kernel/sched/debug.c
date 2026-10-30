@@ -901,6 +901,8 @@ static int __init init_sched_debug_procfs(void)
 
 __initcall(init_sched_debug_procfs);
 
+#define __PS(S, F) \
+	SEQ_printf(m, "%-45s:%21Ld\n", S, (long long)(F))
 #define __P(F) \
 	SEQ_printf(m, "%-45s:%21Ld\n", #F, (long long)F)
 #define P(F) \
@@ -1073,6 +1075,7 @@ void proc_sched_show_task(struct task_struct *p, struct seq_file *m)
 #undef P_SCHEDSTAT
 #undef P
 #undef __P
+#undef __PS
 
 	{
 		unsigned int this_cpu = raw_smp_processor_id();

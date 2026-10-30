@@ -57,6 +57,40 @@ struct fuse_forget_link {
 	struct fuse_forget_link *next;
 };
 
+struct bpf_prog;
+
+/** FUSE specific dentry data */
+struct fuse_dentry {
+	union {
+		u64 time;
+		struct rcu_head rcu;
+	};
+#ifdef CONFIG_FUSE_BPF
+	struct path backing_path;
+#endif
+};
+
+static inline struct fuse_dentry *get_fuse_dentry(const struct dentry *entry)
+{
+	return entry->d_fsdata;
+}
+
+#ifdef CONFIG_FUSE_BPF
+static inline void get_fuse_backing_path(const struct dentry *entry,
+					 struct path *path)
+{
+	struct fuse_dentry *fd = get_fuse_dentry(entry);
+
+	if (!fd) {
+		*path = (struct path) { };
+		return;
+	}
+
+	*path = fd->backing_path;
+	path_get(path);
+}
+#endif
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -928,6 +962,7 @@ void fuse_wait_aborted(struct fuse_conn *fc);
 void fuse_invalidate_attr(struct inode *inode);
 
 void fuse_invalidate_entry_cache(struct dentry *entry);
+void fuse_init_dentry_root(struct dentry *root, struct file *backing_dir);
 
 void fuse_invalidate_atime(struct inode *inode);
 

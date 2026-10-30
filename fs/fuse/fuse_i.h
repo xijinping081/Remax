@@ -192,7 +192,7 @@ struct fuse_in {
 	unsigned numargs;
 
 	/** Array of arguments */
-	struct fuse_in_arg args[3];
+	struct fuse_in_arg args[FUSE_MAX_IN_ARGS];
 };
 
 /** One output argument of a request */
@@ -228,7 +228,7 @@ struct fuse_out {
 	unsigned numargs;
 
 	/** Array of arguments */
-	struct fuse_arg args[2];
+	struct fuse_arg args[FUSE_MAX_OUT_ARGS];
 
 	/* Path used for completing d_canonical_path */
 	struct path *canonical_path;
@@ -241,19 +241,22 @@ struct fuse_page_desc {
 };
 
 struct fuse_args {
+	u32 error_in;
+	unsigned force:1;
+
 	struct {
 		struct {
 			uint32_t opcode;
 			uint64_t nodeid;
 		} h;
 		unsigned numargs;
-		struct fuse_in_arg args[3];
+		struct fuse_in_arg args[FUSE_MAX_IN_ARGS];
 
 	} in;
 	struct {
 		unsigned argvar:1;
 		unsigned numargs;
-		struct fuse_arg args[2];
+		struct fuse_arg args[FUSE_MAX_OUT_ARGS];
 
 		/* Path used for completing d_canonical_path */
 		struct path *canonical_path;

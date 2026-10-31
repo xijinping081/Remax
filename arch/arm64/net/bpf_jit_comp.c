@@ -1215,24 +1215,6 @@ out:
 	return prog;
 }
 
-u64 bpf_jit_alloc_exec_limit(void)
-{
-	return VMALLOC_END - VMALLOC_START;
-}
-
-void *bpf_jit_alloc_exec(unsigned long size)
-{
-	return __vmalloc_node_range(size, PAGE_SIZE, VMALLOC_START,
-				    VMALLOC_END, GFP_KERNEL,
-				    PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
-				    __builtin_return_address(0));
-}
-
-void bpf_jit_free_exec(void *addr)
-{
-	vfree(addr);
-}
-
 #ifdef CONFIG_CFI_CLANG
 bool arch_bpf_jit_check_func(const struct bpf_prog *prog)
 {
@@ -1247,7 +1229,8 @@ bool arch_bpf_jit_check_func(const struct bpf_prog *prog)
 	if (unlikely(!IS_ALIGNED(func, sizeof(u32))))
 		return false;
 
-	if (is_vmalloc_addr(prog->bpf_func))
+	if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+			is_vmalloc_addr(prog->bpf_func))
 		return true;
 
 	return (func >= MODULES_VADDR && func < MODULES_END);

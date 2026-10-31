@@ -14,19 +14,94 @@
 #include <linux/swapops.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/mmu_notifier.h>
+#include <linux/hugetlb.h>
+#include <linux/pagemap.h>
+#include <linux/shmem_fs.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
+
+/*
+ * Install PTEs, to map dst_addr (within dst_vma) to page.
+ *
+ * This function handles both MCOPY_ATOMIC_NORMAL and _CONTINUE for both shmem
+ * and anon, and for both shared and private VMAs.
+ */
+int mfill_atomic_install_pte(struct mm_struct *dst_mm, pmd_t *dst_pmd,
+			     struct vm_area_struct *dst_vma,
+			     unsigned long dst_addr, struct page *page,
+			     bool newly_allocated, bool wp_copy,
+			     struct mem_cgroup *memcg)
+{
+	int ret;
+	pte_t _dst_pte, *dst_pte;
+	bool writable = dst_vma->vm_flags & VM_WRITE;
+	bool vm_shared = dst_vma->vm_flags & VM_SHARED;
+	bool page_in_cache = page_mapping(page);
+	spinlock_t *ptl;
+	struct inode *inode;
+	pgoff_t offset, max_off;
+
+	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
+	if (page_in_cache && !vm_shared)
+		writable = false;
+	if (writable || !page_in_cache)
+		_dst_pte = pte_mkdirty(_dst_pte);
+	if (writable && !wp_copy)
+		_dst_pte = pte_mkwrite(_dst_pte);
+
+	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+
+	if (vma_is_shmem(dst_vma)) {
+		/* serialize against truncate with the page table lock */
+		inode = dst_vma->vm_file->f_inode;
+		offset = linear_page_index(dst_vma, dst_addr);
+		max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+		ret = -EFAULT;
+		if (unlikely(offset >= max_off))
+			goto out_unlock;
+	}
+
+	ret = -EEXIST;
+	if (!pte_none(*dst_pte))
+		goto out_unlock;
+
+	if (page_in_cache)
+		page_add_file_rmap(page, false);
+	else
+		page_add_new_anon_rmap(page, dst_vma, dst_addr, false);
+
+	/*
+	 * Must happen after rmap, as mm_counter() checks mapping (via
+	 * PageAnon()), which is set by __page_set_anon_rmap().
+	 */
+	inc_mm_counter(dst_mm, mm_counter(page));
+
+	/* Commit the 4.9 charge after rmap and before publishing the PTE. */
+	if (memcg)
+		mem_cgroup_commit_charge(page, memcg, false, false);
+
+	if (newly_allocated)
+		lru_cache_add_active_or_unevictable(page, dst_vma);
+
+	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
+
+	/* No need to invalidate - it was non-present before */
+	update_mmu_cache(dst_vma, dst_addr, dst_pte);
+	ret = 0;
+out_unlock:
+	pte_unmap_unlock(dst_pte, ptl);
+	return ret;
+}
 
 static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 			    pmd_t *dst_pmd,
 			    struct vm_area_struct *dst_vma,
 			    unsigned long dst_addr,
 			    unsigned long src_addr,
-			    struct page **pagep)
+			    struct page **pagep,
+			    bool wp_copy)
 {
 	struct mem_cgroup *memcg;
-	pte_t _dst_pte, *dst_pte;
-	spinlock_t *ptl;
 	void *page_kaddr;
 	int ret;
 	struct page *page;
@@ -45,7 +120,7 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 
 		/* fallback to copy_from_user outside mmap_sem */
 		if (unlikely(ret)) {
-			ret = -EFAULT;
+			ret = -ENOENT;
 			*pagep = page;
 			/* don't free the page */
 			goto out;
@@ -68,32 +143,14 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 	if (mem_cgroup_try_charge(page, dst_mm, GFP_KERNEL, &memcg, false))
 		goto out_release;
 
-	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
-	if (dst_vma->vm_flags & VM_WRITE)
-		_dst_pte = pte_mkwrite(pte_mkdirty(_dst_pte));
-
-	ret = -EEXIST;
-	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
-	if (!pte_none(*dst_pte))
-		goto out_release_uncharge_unlock;
-
-	inc_mm_counter(dst_mm, MM_ANONPAGES);
-	page_add_new_anon_rmap(page, dst_vma, dst_addr, false);
-	mem_cgroup_commit_charge(page, memcg, false, false);
-	lru_cache_add_active_or_unevictable(page, dst_vma);
-
-	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
-
-	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(dst_vma, dst_addr, dst_pte);
-
-	pte_unmap_unlock(dst_pte, ptl);
-	ret = 0;
+	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
+				       page, true, wp_copy, memcg);
+	if (ret) {
+		mem_cgroup_cancel_charge(page, memcg, false);
+		goto out_release;
+	}
 out:
 	return ret;
-out_release_uncharge_unlock:
-	pte_unmap_unlock(dst_pte, ptl);
-	mem_cgroup_cancel_charge(page, memcg, false);
 out_release:
 	put_page(page);
 	goto out;
@@ -107,11 +164,22 @@ static int mfill_zeropage_pte(struct mm_struct *dst_mm,
 	pte_t _dst_pte, *dst_pte;
 	spinlock_t *ptl;
 	int ret;
+	pgoff_t offset, max_off;
+	struct inode *inode;
 
 	_dst_pte = pte_mkspecial(pfn_pte(my_zero_pfn(dst_addr),
 					 dst_vma->vm_page_prot));
-	ret = -EEXIST;
 	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+	if (dst_vma->vm_file) {
+		/* the shmem MAP_PRIVATE case requires checking the i_size */
+		inode = dst_vma->vm_file->f_inode;
+		offset = linear_page_index(dst_vma, dst_addr);
+		max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+		ret = -EFAULT;
+		if (unlikely(offset >= max_off))
+			goto out_unlock;
+	}
+	ret = -EEXIST;
 	if (!pte_none(*dst_pte))
 		goto out_unlock;
 	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
@@ -121,6 +189,41 @@ static int mfill_zeropage_pte(struct mm_struct *dst_mm,
 out_unlock:
 	pte_unmap_unlock(dst_pte, ptl);
 	return ret;
+}
+
+/* Handles UFFDIO_CONTINUE for all shmem VMAs (shared or private). */
+static int mcontinue_atomic_pte(struct mm_struct *dst_mm,
+				pmd_t *dst_pmd,
+				struct vm_area_struct *dst_vma,
+				unsigned long dst_addr,
+				bool wp_copy)
+{
+	struct inode *inode = file_inode(dst_vma->vm_file);
+	pgoff_t pgoff = linear_page_index(dst_vma, dst_addr);
+	struct page *page;
+	int ret;
+
+	ret = shmem_getpage(inode, pgoff, &page, SGP_READ);
+	if (ret)
+		goto out;
+	if (!page) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
+				       page, false, wp_copy, NULL);
+	if (ret)
+		goto out_release;
+
+	unlock_page(page);
+	ret = 0;
+out:
+	return ret;
+out_release:
+	unlock_page(page);
+	put_page(page);
+	goto out;
 }
 
 static pmd_t *mm_alloc_pmd(struct mm_struct *mm, unsigned long address)
@@ -151,7 +254,9 @@ static __always_inline ssize_t __mcopy_atomic_hugetlb(struct mm_struct *dst_mm,
 					      unsigned long dst_start,
 					      unsigned long src_start,
 					      unsigned long len,
-					      bool zeropage)
+					      atomic_t *mmap_changing,
+					      enum mcopy_atomic_mode mode,
+					      __u64 uffd_flags)
 {
 	int vm_alloc_shared = dst_vma->vm_flags & VM_SHARED;
 	int vm_shared = dst_vma->vm_flags & VM_SHARED;
@@ -172,7 +277,7 @@ static __always_inline ssize_t __mcopy_atomic_hugetlb(struct mm_struct *dst_mm,
 	 * by THP.  Since we can not reliably insert a zero page, this
 	 * feature is not supported.
 	 */
-	if (zeropage) {
+	if (mode == MCOPY_ATOMIC_ZEROPAGE) {
 		up_read(&dst_mm->mmap_sem);
 		return -EINVAL;
 	}
@@ -235,8 +340,6 @@ retry:
 	h = hstate_vma(dst_vma);
 
 	while (src_addr < src_start + len) {
-		pte_t dst_pteval;
-
 		BUG_ON(dst_addr >= dst_start + len);
 		VM_BUG_ON(dst_addr & ~huge_page_mask(h));
 
@@ -249,21 +352,21 @@ retry:
 		mutex_lock(&hugetlb_fault_mutex_table[hash]);
 
 		err = -ENOMEM;
-		dst_pte = huge_pte_alloc(dst_mm, dst_addr, huge_page_size(h));
+		dst_pte = huge_pte_alloc(dst_mm, dst_vma, dst_addr, huge_page_size(h));
 		if (!dst_pte) {
 			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
 			goto out_unlock;
 		}
 
-		err = -EEXIST;
-		dst_pteval = huge_ptep_get(dst_pte);
-		if (!huge_pte_none(dst_pteval)) {
+		if (mode != MCOPY_ATOMIC_CONTINUE &&
+		    !huge_pte_none(huge_ptep_get(dst_pte))) {
+			err = -EEXIST;
 			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
 			goto out_unlock;
 		}
 
 		err = hugetlb_mcopy_atomic_pte(dst_mm, dst_pte, dst_vma,
-						dst_addr, src_addr, &page);
+					       dst_addr, src_addr, mode, &page);
 
 		mutex_unlock(&hugetlb_fault_mutex_table[hash]);
 		vm_alloc_shared = vm_shared;
@@ -281,7 +384,23 @@ retry:
 				err = -EFAULT;
 				goto out;
 			}
-			down_read(&dst_mm->mmap_sem);
+			if (uffd_flags & UFFDIO_MODE_MMAP_TRYLOCK) {
+				if (!down_read_trylock(&dst_mm->mmap_sem)) {
+					err = -EAGAIN;
+					goto out;
+				}
+			} else {
+				down_read(&dst_mm->mmap_sem);
+			}
+			/*
+			 * If memory mappings are changing because of non-cooperative
+			 * operation (e.g. mremap) running in parallel, bail out and
+			 * request the user to retry later
+			 */
+			if (mmap_changing && atomic_read(mmap_changing)) {
+				err = -EAGAIN;
+				break;
+			}
 
 			dst_vma = NULL;
 			goto retry;
@@ -363,7 +482,9 @@ extern ssize_t __mcopy_atomic_hugetlb(struct mm_struct *dst_mm,
 				      unsigned long dst_start,
 				      unsigned long src_start,
 				      unsigned long len,
-				      bool zeropage);
+				      atomic_t *mmap_changing,
+				      enum mcopy_atomic_mode mode,
+					      __u64 uffd_flags);
 #endif /* CONFIG_HUGETLB_PAGE */
 
 static __always_inline ssize_t mfill_atomic_pte(struct mm_struct *dst_mm,
@@ -372,9 +493,14 @@ static __always_inline ssize_t mfill_atomic_pte(struct mm_struct *dst_mm,
 						unsigned long dst_addr,
 						unsigned long src_addr,
 						struct page **page,
-						bool zeropage)
+						enum mcopy_atomic_mode mode,
+						bool wp_copy)
 {
 	ssize_t err;
+
+	if (mode == MCOPY_ATOMIC_CONTINUE)
+		return mcontinue_atomic_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
+					    wp_copy);
 
 	/*
 	 * The normal page fault path for a shmem will invoke the
@@ -387,20 +513,19 @@ static __always_inline ssize_t mfill_atomic_pte(struct mm_struct *dst_mm,
 	 * and not in the radix tree.
 	 */
 	if (!(dst_vma->vm_flags & VM_SHARED)) {
-		if (!zeropage)
+		if (mode == MCOPY_ATOMIC_NORMAL)
 			err = mcopy_atomic_pte(dst_mm, dst_pmd, dst_vma,
-					       dst_addr, src_addr, page);
+					       dst_addr, src_addr, page,
+					       wp_copy);
 		else
 			err = mfill_zeropage_pte(dst_mm, dst_pmd,
 						 dst_vma, dst_addr);
 	} else {
-		if (!zeropage)
-			err = shmem_mcopy_atomic_pte(dst_mm, dst_pmd,
-						     dst_vma, dst_addr,
-						     src_addr, page);
-		else
-			err = shmem_mfill_zeropage_pte(dst_mm, dst_pmd,
-						       dst_vma, dst_addr);
+		VM_WARN_ON_ONCE(wp_copy);
+		err = shmem_mfill_atomic_pte(dst_mm, dst_pmd, dst_vma,
+					     dst_addr, src_addr,
+					     mode != MCOPY_ATOMIC_NORMAL,
+					     page);
 	}
 
 	return err;
@@ -410,7 +535,9 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 					      unsigned long dst_start,
 					      unsigned long src_start,
 					      unsigned long len,
-					      bool zeropage)
+					      enum mcopy_atomic_mode mcopy_mode,
+					      atomic_t *mmap_changing,
+					      __u64 mode)
 {
 	struct vm_area_struct *dst_vma;
 	ssize_t err;
@@ -418,10 +545,13 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 	unsigned long src_addr, dst_addr;
 	long copied;
 	struct page *page;
+	bool wp_copy;
 
 	/*
 	 * Sanitize the command parameters:
 	 */
+	BUILD_BUG_ON(UFFDIO_ZEROPAGE_MODE_MMAP_TRYLOCK !=
+		     UFFDIO_COPY_MODE_MMAP_TRYLOCK);
 	BUG_ON(dst_start & ~PAGE_MASK);
 	BUG_ON(len & ~PAGE_MASK);
 
@@ -434,20 +564,30 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 	copied = 0;
 	page = NULL;
 retry:
-	down_read(&dst_mm->mmap_sem);
+	err = -EAGAIN;
+	if (mode & UFFDIO_MODE_MMAP_TRYLOCK) {
+		if (!down_read_trylock(&dst_mm->mmap_sem))
+			goto out;
+	} else {
+		down_read(&dst_mm->mmap_sem);
+	}
+
+	/*
+	 * If memory mappings are changing because of non-cooperative
+	 * operation (e.g. mremap) running in parallel, bail out and
+	 * request the user to retry later
+	 */
+	if (mmap_changing && atomic_read(mmap_changing))
+		goto out_unlock;
 
 	/*
 	 * Make sure the vma is not shared, that the dst range is
 	 * both valid and fully within a single existing vma.
 	 */
-	err = -EINVAL;
+	err = -ENOENT;
 	dst_vma = find_vma(dst_mm, dst_start);
-	if (!dst_vma || (dst_vma->vm_flags & VM_SHARED))
+	if (!dst_vma)
 		goto out_unlock;
-	if (dst_start < dst_vma->vm_start ||
-	    dst_start + len > dst_vma->vm_end)
-		goto out_unlock;
-
 	/*
 	 * Check the vma is registered in uffd, this is required to
 	 * enforce the VM_MAYWRITE check done at uffd registration
@@ -456,11 +596,38 @@ retry:
 	if (!dst_vma->vm_userfaultfd_ctx.ctx)
 		goto out_unlock;
 
+	if (dst_start < dst_vma->vm_start ||
+	    dst_start + len > dst_vma->vm_end)
+		goto out_unlock;
+
+	err = -EINVAL;
 	/*
-	 * FIXME: only allow copying on anonymous vmas, tmpfs should
-	 * be added.
+	 * shmem_zero_setup is invoked in mmap for MAP_ANONYMOUS|MAP_SHARED but
+	 * it will overwrite vm_ops, so vma_is_anonymous must return false.
 	 */
-	if (dst_vma->vm_ops)
+	if (WARN_ON_ONCE(vma_is_anonymous(dst_vma) &&
+	    dst_vma->vm_flags & VM_SHARED))
+		goto out_unlock;
+
+	/*
+	 * validate 'mode' now that we know the dst_vma: don't allow
+	 * a wrprotect copy if the userfaultfd didn't register as WP.
+	 */
+	wp_copy = mode & UFFDIO_COPY_MODE_WP;
+	if (wp_copy && !(dst_vma->vm_flags & VM_UFFD_WP))
+		goto out_unlock;
+
+	/*
+	 * If this is a HUGETLB vma, pass off to appropriate routine
+	 */
+	if (is_vm_hugetlb_page(dst_vma))
+		return  __mcopy_atomic_hugetlb(dst_mm, dst_vma, dst_start,
+						src_start, len, mmap_changing,
+						mcopy_mode, mode);
+
+	if (!vma_is_anonymous(dst_vma) && !vma_is_shmem(dst_vma))
+		goto out_unlock;
+	if (!vma_is_shmem(dst_vma) && mcopy_mode == MCOPY_ATOMIC_CONTINUE)
 		goto out_unlock;
 
 	/*
@@ -469,7 +636,8 @@ retry:
 	 * dst_vma.
 	 */
 	err = -ENOMEM;
-	if (unlikely(anon_vma_prepare(dst_vma)))
+	if (!(dst_vma->vm_flags & VM_SHARED) &&
+	    unlikely(anon_vma_prepare(dst_vma)))
 		goto out_unlock;
 
 	while (src_addr < src_start + len) {
@@ -506,17 +674,21 @@ retry:
 		BUG_ON(pmd_none(*dst_pmd));
 		BUG_ON(pmd_trans_huge(*dst_pmd));
 
-		if (!zeropage)
-			err = mcopy_atomic_pte(dst_mm, dst_pmd, dst_vma,
-					       dst_addr, src_addr, &page);
-		else
-			err = mfill_zeropage_pte(dst_mm, dst_pmd, dst_vma,
-						 dst_addr);
-
+		err = mfill_atomic_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
+				       src_addr, &page, mcopy_mode, wp_copy);
 		cond_resched();
 
-		if (unlikely(err == -EFAULT)) {
+		if (unlikely(err == -ENOENT)) {
 			void *page_kaddr;
+
+			/*
+			 * Return early due to mmap_lock contention only after
+			 * some pages are copied to ensure that jank sensitive
+			 * threads don't keep retrying for progress-critical
+			 * pages.
+			 */
+			if (copied && rwsem_is_contended(&dst_mm->mmap_sem))
+				break;
 
 			up_read(&dst_mm->mmap_sem);
 			BUG_ON(!page);
@@ -542,6 +714,9 @@ retry:
 
 			if (fatal_signal_pending(current))
 				err = -EINTR;
+
+			if (rwsem_is_contended(&dst_mm->mmap_sem))
+				err = -EAGAIN;
 		}
 		if (err)
 			break;
@@ -559,13 +734,23 @@ out:
 }
 
 ssize_t mcopy_atomic(struct mm_struct *dst_mm, unsigned long dst_start,
-		     unsigned long src_start, unsigned long len)
+		     unsigned long src_start, unsigned long len,
+		     atomic_t *mmap_changing, __u64 mode)
 {
-	return __mcopy_atomic(dst_mm, dst_start, src_start, len, false);
+	return __mcopy_atomic(dst_mm, dst_start, src_start, len,
+			      MCOPY_ATOMIC_NORMAL, mmap_changing, mode);
 }
 
 ssize_t mfill_zeropage(struct mm_struct *dst_mm, unsigned long start,
-		       unsigned long len)
+		       unsigned long len, atomic_t *mmap_changing, __u64 mode)
 {
-	return __mcopy_atomic(dst_mm, start, 0, len, true);
+	return __mcopy_atomic(dst_mm, start, 0, len, MCOPY_ATOMIC_ZEROPAGE,
+			      mmap_changing, mode);
+}
+
+ssize_t mcopy_continue(struct mm_struct *dst_mm, unsigned long start,
+		       unsigned long len, atomic_t *mmap_changing)
+{
+	return __mcopy_atomic(dst_mm, start, 0, len, MCOPY_ATOMIC_CONTINUE,
+			      mmap_changing, 0);
 }

@@ -34,6 +34,8 @@
 #include <linux/uio.h>
 #include <linux/khugepaged.h>
 
+#include <asm/tlbflush.h> /* for arch/microblaze update_mmu_cache() */
+
 static struct vfsmount *shm_mnt;
 
 #ifdef CONFIG_SHMEM
@@ -70,6 +72,8 @@ static struct vfsmount *shm_mnt;
 #include <linux/syscalls.h>
 #include <linux/fcntl.h>
 #include <uapi/linux/memfd.h>
+#include <linux/userfaultfd_k.h>
+#include <linux/rmap.h>
 
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
@@ -115,13 +119,14 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 				struct shmem_inode_info *info, pgoff_t index);
 static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 		struct page **pagep, enum sgp_type sgp,
-		gfp_t gfp, struct mm_struct *fault_mm, int *fault_type);
+		gfp_t gfp, struct vm_area_struct *vma,
+		struct vm_fault *vmf, int *fault_type);
 
 int shmem_getpage(struct inode *inode, pgoff_t index,
 		struct page **pagep, enum sgp_type sgp)
 {
 	return shmem_getpage_gfp(inode, index, pagep, sgp,
-		mapping_gfp_mask(inode->i_mapping), NULL, NULL);
+		mapping_gfp_mask(inode->i_mapping), NULL, NULL, NULL);
 }
 
 static inline struct shmem_sb_info *SHMEM_SB(struct super_block *sb)
@@ -1574,12 +1579,12 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
  * vm. If we swap it in we mark it dirty since we also free the swap
  * entry since a page cannot live in both the swap and page cache.
  *
- * fault_mm and fault_type are only supplied by shmem_fault:
+ * vma, vmf, and fault_type are only supplied by shmem_fault:
  * otherwise they are NULL.
  */
 static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 	struct page **pagep, enum sgp_type sgp, gfp_t gfp,
-	struct mm_struct *fault_mm, int *fault_type)
+	struct vm_area_struct *vma, struct vm_fault *vmf, int *fault_type)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info = SHMEM_I(inode);
@@ -1601,6 +1606,22 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 repeat:
 	swap.val = 0;
 	page = find_lock_entry(mapping, index);
+
+	if (page && vma && userfaultfd_minor(vma)) {
+		struct fault_env fe = {
+			.vma = vma,
+			.address = (unsigned long)vmf->virtual_address,
+			.flags = vmf->flags,
+		};
+
+		if (!radix_tree_exceptional_entry(page)) {
+			unlock_page(page);
+			put_page(page);
+		}
+		*fault_type = handle_userfault(&fe, VM_UFFD_MINOR);
+		return 0;
+	}
+
 	if (radix_tree_exceptional_entry(page)) {
 		swap = radix_to_swp_entry(page);
 		page = NULL;
@@ -1633,7 +1654,7 @@ repeat:
 	 * bring it back from swap or allocate.
 	 */
 	sbinfo = SHMEM_SB(inode->i_sb);
-	charge_mm = fault_mm ? : current->mm;
+	charge_mm = vma ? vma->vm_mm : current->mm;
 
 	if (swap.val) {
 		/* Look it up and read it in.. */
@@ -1643,7 +1664,8 @@ repeat:
 			if (fault_type) {
 				*fault_type |= VM_FAULT_MAJOR;
 				count_vm_event(PGMAJFAULT);
-				mem_cgroup_count_vm_event(fault_mm, PGMAJFAULT);
+				mem_cgroup_count_vm_event(charge_mm,
+							  PGMAJFAULT);
 			}
 			/* Here we actually start the io */
 			page = shmem_swapin(swap, gfp, info, index);
@@ -1712,6 +1734,17 @@ repeat:
 		swap_free(swap);
 
 	} else {
+		if (vma && userfaultfd_missing(vma)) {
+			struct fault_env fe = {
+				.vma = vma,
+				.address = (unsigned long)vmf->virtual_address,
+				.flags = vmf->flags,
+			};
+
+			*fault_type = handle_userfault(&fe, VM_UFFD_MISSING);
+			return 0;
+		}
+
 		/* shmem_symlink() */
 		if (mapping->a_ops != &shmem_aops)
 			goto alloc_nohuge;
@@ -1974,7 +2007,7 @@ static int shmem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 		sgp = SGP_NOHUGE;
 
 	error = shmem_getpage_gfp(inode, vmf->pgoff, &vmf->page, sgp,
-				  gfp, vma->vm_mm, &ret);
+				  gfp, vma, vmf, &ret);
 	if (error)
 		return ((error == -ENOMEM) ? VM_FAULT_OOM : VM_FAULT_SIGBUS);
 	return ret;
@@ -2118,21 +2151,23 @@ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct shmem_inode_info *info = SHMEM_I(file_inode(file));
 
-
 	if (info->seals & F_SEAL_FUTURE_WRITE) {
 		/*
 		 * New PROT_WRITE and MAP_SHARED mmaps are not allowed when
-		 * "future write" seal active.
+		 * the future-write seal is active.
 		 */
-		if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
+		if ((vma->vm_flags & VM_SHARED) &&
+		    (vma->vm_flags & VM_WRITE))
 			return -EPERM;
 
 		/*
-		 * Since the F_SEAL_FUTURE_WRITE seals allow for a MAP_SHARED
-		 * read-only mapping, take care to not allow mprotect to revert
-		 * protections.
+		 * A sealed memfd can still be mapped MAP_SHARED and
+		 * read-only. Do not let mprotect() restore write access
+		 * on shared mappings. Private mappings must retain
+		 * VM_MAYWRITE so their normal COW behavior is preserved.
 		 */
-		vma->vm_flags &= ~(VM_MAYWRITE);
+		if (vma->vm_flags & VM_SHARED)
+			vma->vm_flags &= ~VM_MAYWRITE;
 	}
 
 	file_accessed(file);
@@ -2214,6 +2249,120 @@ bool shmem_mapping(struct address_space *mapping)
 	return mapping->host->i_sb->s_op == &shmem_ops;
 }
 
+#ifdef CONFIG_USERFAULTFD
+int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+			   pmd_t *dst_pmd,
+			   struct vm_area_struct *dst_vma,
+			   unsigned long dst_addr,
+			   unsigned long src_addr,
+			   bool zeropage,
+			   struct page **pagep)
+{
+	struct inode *inode = file_inode(dst_vma->vm_file);
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct address_space *mapping = inode->i_mapping;
+	gfp_t gfp = mapping_gfp_mask(mapping);
+	pgoff_t pgoff = linear_page_index(dst_vma, dst_addr);
+	struct mem_cgroup *memcg;
+	void *page_kaddr;
+	struct page *page;
+	int ret;
+	pgoff_t max_off;
+
+	if (!shmem_inode_acct_block(inode, 1)) {
+		/*
+		 * We may have got a page, returned -ENOENT triggering a retry,
+		 * and now we find ourselves with -ENOMEM. Release the page, to
+		 * avoid a BUG_ON in our caller.
+		 */
+		if (unlikely(*pagep)) {
+			put_page(*pagep);
+			*pagep = NULL;
+		}
+		return -ENOMEM;
+	}
+
+	if (!*pagep) {
+		ret = -ENOMEM;
+		page = shmem_alloc_page(gfp, info, pgoff);
+		if (!page)
+			goto out_unacct_blocks;
+
+		if (!zeropage) {	/* COPY */
+			page_kaddr = kmap_atomic(page);
+			ret = copy_from_user(page_kaddr,
+					     (const void __user *)src_addr,
+					     PAGE_SIZE);
+			kunmap_atomic(page_kaddr);
+
+			/* fallback to copy_from_user outside mmap_sem */
+			if (unlikely(ret)) {
+				*pagep = page;
+				ret = -ENOENT;
+				/* don't free the page */
+				goto out_unacct_blocks;
+			}
+		} else {		/* ZEROPAGE */
+			clear_highpage(page);
+		}
+	} else {
+		page = *pagep;
+		*pagep = NULL;
+	}
+
+	VM_BUG_ON(PageLocked(page));
+	VM_BUG_ON(PageSwapBacked(page));
+	__SetPageLocked(page);
+	__SetPageSwapBacked(page);
+	__SetPageUptodate(page);
+
+	ret = -EFAULT;
+	max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+	if (unlikely(pgoff >= max_off))
+		goto out_release;
+
+	ret = mem_cgroup_try_charge(page, dst_mm, gfp, &memcg, false);
+	if (ret)
+		goto out_release;
+
+	ret = radix_tree_maybe_preload(gfp & GFP_RECLAIM_MASK);
+	if (!ret) {
+		ret = shmem_add_to_page_cache(page, mapping, pgoff, NULL);
+		radix_tree_preload_end();
+	}
+	if (ret)
+		goto out_release_uncharge;
+
+	mem_cgroup_commit_charge(page, memcg, false, false);
+
+	ret = mfill_atomic_install_pte(dst_mm, dst_pmd, dst_vma, dst_addr,
+				       page, true, false, NULL);
+	if (ret)
+		goto out_delete_from_cache;
+
+	spin_lock_irq(&info->lock);
+	info->alloced++;
+	inode->i_blocks += BLOCKS_PER_PAGE;
+	shmem_recalc_inode(inode);
+	spin_unlock_irq(&info->lock);
+
+	SetPageDirty(page);
+	unlock_page(page);
+	return 0;
+out_delete_from_cache:
+	delete_from_page_cache(page);
+	goto out_release;
+out_release_uncharge:
+	mem_cgroup_cancel_charge(page, memcg, false);
+out_release:
+	unlock_page(page);
+	put_page(page);
+out_unacct_blocks:
+	shmem_inode_unacct_blocks(inode, 1);
+	return ret;
+}
+#endif /* CONFIG_USERFAULTFD */
+
 #ifdef CONFIG_TMPFS
 static const struct inode_operations shmem_symlink_inode_operations;
 static const struct inode_operations shmem_short_symlink_operations;
@@ -2234,9 +2383,9 @@ shmem_write_begin(struct file *file, struct address_space *mapping,
 	pgoff_t index = pos >> PAGE_SHIFT;
 
 	/* i_mutex is held by caller */
-	if (unlikely(info->seals & (F_SEAL_GROW |
-				   F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))) {
-		if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))
+	if (unlikely(info->seals)) {
+		if (info->seals &
+		    (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))
 			return -EPERM;
 		if ((info->seals & F_SEAL_GROW) && pos + len > inode->i_size)
 			return -EPERM;
@@ -2621,6 +2770,7 @@ int shmem_add_seals(struct file *file, unsigned int seals)
 	 *   SEAL_SHRINK: Prevent the file from shrinking
 	 *   SEAL_GROW: Prevent the file from growing
 	 *   SEAL_WRITE: Prevent write access to the file
+	 *   SEAL_FUTURE_WRITE: Prevent future write access
 	 *
 	 * As we don't require any trust relationship between two parties, we
 	 * must prevent seals from being removed. Therefore, sealing a file
@@ -2724,7 +2874,8 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 		DECLARE_WAIT_QUEUE_HEAD_ONSTACK(shmem_falloc_waitq);
 
 		/* protected by i_mutex */
-		if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) {
+		if (info->seals &
+		    (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) {
 			error = -EPERM;
 			goto out;
 		}
@@ -4187,7 +4338,7 @@ struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
 
 	BUG_ON(mapping->a_ops != &shmem_aops);
 	error = shmem_getpage_gfp(inode, index, &page, SGP_CACHE,
-				  gfp, NULL, NULL);
+				  gfp, NULL, NULL, NULL);
 	if (error)
 		page = ERR_PTR(error);
 	else

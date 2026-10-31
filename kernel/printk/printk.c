@@ -636,9 +636,9 @@ static int syslog_action_restricted(int type)
 
 int check_syslog_permissions(int type, int source)
 {
-	/* Allow reading the log buffer without CAP_SYSLOG */
+	/* Allow reading the log buffer without CAP_SYSLOG or SELinux check */
 	if (type == SYSLOG_ACTION_READ_ALL || type == SYSLOG_ACTION_SIZE_BUFFER)
-		goto ok;
+		return 0;
 
 	/*
 	 * If this is from /proc/kmsg and we've already opened it, then we've

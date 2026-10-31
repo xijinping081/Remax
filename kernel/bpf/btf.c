@@ -3299,6 +3299,9 @@ struct btf *btf_parse_vmlinux(void)
 	struct btf *btf = NULL;
 	int err;
 
+	if (_binary__btf_vmlinux_bin_start == _binary__btf_vmlinux_bin_end)
+		return NULL;
+
 	env = kzalloc(sizeof(*env), GFP_KERNEL | __GFP_NOWARN);
 	if (!env)
 		return ERR_PTR(-ENOMEM);

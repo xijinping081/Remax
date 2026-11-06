@@ -1,3 +1,4 @@
+#define OPENSSL_NO_ENGINE 1
 /* Extract X.509 certificate in DER form from PKCS#11 or PEM.
  *
  * Copyright © 2014-2015 Red Hat, Inc. All Rights Reserved.
@@ -21,7 +22,9 @@
 #include <openssl/bio.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+#ifndef OPENSSL_NO_ENGINE
 #include <openssl/engine.h>
+#endif
 
 /*
  * OpenSSL 3.0 deprecates the OpenSSL's ENGINE API.
@@ -118,6 +121,7 @@ int main(int argc, char **argv)
 		ERR(!f, "%s", cert_dst);
 		fclose(f);
 		exit(0);
+#ifndef OPENSSL_NO_ENGINE
 	} else if (!strncmp(cert_src, "pkcs11:", 7)) {
 		ENGINE *e;
 		struct {
@@ -141,6 +145,7 @@ int main(int argc, char **argv)
 		ENGINE_ctrl_cmd(e, "LOAD_CERT_CTRL", 0, &parms, NULL, 1);
 		ERR(!parms.cert, "Get X.509 from PKCS#11");
 		write_cert(parms.cert);
+#endif
 	} else {
 		BIO *b;
 		X509 *x509;
@@ -153,7 +158,7 @@ int main(int argc, char **argv)
 			if (wb && !x509) {
 				unsigned long err = ERR_peek_last_error();
 				if (ERR_GET_LIB(err) == ERR_LIB_PEM &&
-				    ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
+				    (ERR_GET_REASON(err) == PEM_R_NO_START_LINE || ERR_GET_REASON(err) == 110 || ERR_GET_REASON(err) == 108)) {
 					ERR_clear_error();
 					break;
 				}

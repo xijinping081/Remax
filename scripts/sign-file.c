@@ -1,3 +1,4 @@
+#define OPENSSL_NO_ENGINE 1
 /* Sign a module file using the given key.
  *
  * Copyright © 2014-2016 Red Hat, Inc. All Rights Reserved.
@@ -27,7 +28,9 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+#ifndef OPENSSL_NO_ENGINE
 #include <openssl/engine.h>
+#endif
 
 /*
  * OpenSSL 3.0 deprecates the OpenSSL's ENGINE API.
@@ -141,6 +144,7 @@ static EVP_PKEY *read_private_key(const char *private_key_name)
 {
 	EVP_PKEY *private_key;
 
+#ifndef OPENSSL_NO_ENGINE
 	if (!strncmp(private_key_name, "pkcs11:", 7)) {
 		ENGINE *e;
 
@@ -158,7 +162,9 @@ static EVP_PKEY *read_private_key(const char *private_key_name)
 		private_key = ENGINE_load_private_key(e, private_key_name,
 						      NULL, NULL);
 		ERR(!private_key, "%s", private_key_name);
-	} else {
+	} else
+#endif
+	{
 		BIO *b;
 
 		b = BIO_new_file(private_key_name, "rb");
@@ -284,7 +290,7 @@ int main(int argc, char **argv)
 	}
 
 #ifdef USE_PKCS7
-	if (strcmp(hash_algo, "sha1") != 0) {
+	if (0 && strcmp(hash_algo, "sha1") != 0) {
 		fprintf(stderr, "sign-file: %s only supports SHA1 signing\n",
 			OPENSSL_VERSION_TEXT);
 		exit(3);

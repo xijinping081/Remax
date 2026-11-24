@@ -41,7 +41,9 @@ static DEFINE_IDR(zram_index_idr);
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
-#ifdef CONFIG_CRYPTO_LZ4
+#ifdef CONFIG_CRYPTO_ZSTD
+static const char *default_compressor = "zstd";
+#elif defined(CONFIG_CRYPTO_LZ4)
 static const char *default_compressor = "lz4";
 #else
 static const char *default_compressor = "lzo";
@@ -992,7 +994,6 @@ static ssize_t comp_algorithm_show(struct device *dev,
 static ssize_t comp_algorithm_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
-#if 0
 	struct zram *zram = dev_to_zram(dev);
 	char compressor[ARRAY_SIZE(zram->compressor)];
 	size_t sz;
@@ -1013,9 +1014,15 @@ static ssize_t comp_algorithm_store(struct device *dev,
 		return -EBUSY;
 	}
 
+#ifdef CONFIG_CRYPTO_ZSTD
+	if (!strcmp(compressor, "lz4") || !strcmp(compressor, "lzo"))
+		strcpy(zram->compressor, "zstd");
+	else
+		strcpy(zram->compressor, compressor);
+#else
 	strcpy(zram->compressor, compressor);
-	up_write(&zram->init_lock);
 #endif
+	up_write(&zram->init_lock);
 	return len;
 }
 
